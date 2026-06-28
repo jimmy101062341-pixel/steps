@@ -104,7 +104,7 @@ class MyCobotArm(ArmInterface):
 #  示範:上層程式長這樣 —— 完全沒有 pymycobot 的影子
 # ============================================================
 if __name__ == "__main__":
-    arm: ArmInterface = MyCobotArm("/dev/ttyUSB0", 115200)   # 換手臂只改這一行
+    arm: ArmInterface = MyCobotArm("/dev/ttyAMA0", 1000000)   # 換手臂只改這一行
 
     pose = arm.get_tcp_pose()
     print("目前 TCP pose(公尺):\n", np.round(pose, 4))
