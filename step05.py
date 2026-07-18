@@ -18,7 +18,8 @@ import time
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-
+XYZ_LIM = (-280.0, 280.0)
+RPY_LIM = (-314.0, 314.0)
 # ============================================================
 #  抽象介面 —— 這層定義「手臂應該會做什麼」,與廠牌無關
 # ============================================================
@@ -69,8 +70,7 @@ def pose_to_coords(pose: np.ndarray):
 # ============================================================
 class MyCobotArm(ArmInterface):
 
-    XYZ_LIM = (-280.0, 280.0)
-    RPY_LIM = (-314.0, 314.0)
+    
 
     def __init__(self, port: str, baud: int = 115200):
         from pymycobot import MyCobot280            # 實作層才 import,上層不依賴它
