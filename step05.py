@@ -136,7 +136,9 @@ class MyCobotArm(ArmInterface):
 # ============================================================
 if __name__ == "__main__":
     arm: ArmInterface = MyCobotArm("/dev/ttyAMA0", 1000000)   # 換手臂只改這一行
-
+    arm._mc.send_coords([180, 0, 200, 0, 0, 0], 40, 0)   # Z=200,安全範圍內
+    time.sleep(4)
+    
     pose = arm.get_tcp_pose()
     print("目前 TCP pose(公尺):\n", np.round(pose, 4))
 
