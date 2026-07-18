@@ -69,6 +69,9 @@ def pose_to_coords(pose: np.ndarray):
 # ============================================================
 class MyCobotArm(ArmInterface):
 
+    XYZ_LIM = (-280.0, 280.0)
+    RPY_LIM = (-314.0, 314.0)
+
     def __init__(self, port: str, baud: int = 115200):
         from pymycobot import MyCobot280            # 實作層才 import,上層不依賴它
         self._mc = MyCobot280(port, baud)
@@ -76,11 +79,39 @@ class MyCobotArm(ArmInterface):
         self._mc.power_on()
         self._settle = 3.0                          # 等手臂停穩的秒數
 
+    
+
     def move_to_pose(self, pose: np.ndarray, speed: int = 30) -> bool:
         coords = pose_to_coords(pose)
-        self._mc.send_coords(coords, speed, 1)      # mode 1 = 直線插補
+        ok, msg = self._validate(coords)
+        if not ok:
+            raise ValueError(f"目標超出 myCobot 280 可命令範圍 -> {msg}\n"
+                            f"  完整目標: {[round(v,1) for v in coords]}")
+        self._mc.send_coords(coords, speed, 0)      # mode 0 關節插補,較不易無解
         time.sleep(self._settle)
-        return True                                 # TODO: 之後可比對讀回值驗證到位
+        return self._verify(coords)
+
+    @staticmethod
+    def _validate(coords):
+        for n, v in zip("xyz", coords[:3]):
+            if not (XYZ_LIM[0] <= v <= XYZ_LIM[1]):
+                return False, f"{n}={v:.1f} 超出 {XYZ_LIM}"
+        for n, v in zip(("rx", "ry", "rz"), coords[3:]):
+            if not (RPY_LIM[0] <= v <= RPY_LIM[1]):
+                return False, f"{n}={v:.1f} 超出 {RPY_LIM}"
+        return True, ""
+
+    def _verify(self, target, tol_mm=10.0):
+        """驗證真的到位 —— 沒到就講出來,不要假裝成功。"""
+        actual = self._mc.get_coords()
+        if not actual:
+            print("⚠ 讀不回座標,無法確認到位")
+            return False
+        err = float(np.linalg.norm(np.array(actual[:3]) - np.array(target[:3])))
+        if err > tol_mm:
+            print(f"⚠ 未到位:誤差 {err:.1f}mm —— 可能 IK 無解或路徑受阻")
+            return False
+        return True
 
     def get_tcp_pose(self) -> np.ndarray:
         coords = self._mc.get_coords()
