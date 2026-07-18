@@ -95,17 +95,42 @@ class MyCobotArm(ArmInterface):
         self._settle = 3.0
 
     # ---- 移動 ----
-    def move_to_pose(self, pose: np.ndarray, speed: int = 30) -> bool:
-        coords = pose_to_coords(pose)
-        ok, msg = self._validate(coords)
+    def move_to_pose(self, pose: np.ndarray, speed: int = 30,
+                     max_step_mm: float = 20.0) -> bool:
+        """移動到目標 pose。大位移自動拆成小步(這支手臂大幅座標移動易無解)。"""
+        target = pose_to_coords(pose)
+        ok, msg = self._validate(target)
         if not ok:
             raise ValueError(
                 f"目標超出 myCobot 280 可命令範圍 -> {msg}\n"
-                f"  完整目標: {[round(v,1) for v in coords]}\n"
-                f"  提示:先呼叫 arm.home() 回到工作姿態再做相對移動。")
-        self._mc.send_coords(coords, speed, 0)     # mode 0 關節插補,較不易無解
-        time.sleep(self._settle)
-        return self._verify(coords)
+                f"  完整目標: {[round(v,1) for v in target]}\n"
+                f"  提示:先 arm.home() 再做相對移動。")
+
+        start = self._mc.get_coords()
+        if not start:
+            print("⚠ 讀不到起點座標")
+            return False
+
+        # 依直線距離決定要拆幾步
+        dist = np.linalg.norm(np.array(target[:3]) - np.array(start[:3]))
+        n = max(1, int(np.ceil(dist / max_step_mm)))
+        for k in range(1, n + 1):
+            inter = [start[i] + (target[i] - start[i]) * k / n for i in range(6)]
+            self._mc.send_coords(inter, speed, 0)
+            time.sleep(self._settle if k == n else 1.0)
+
+        return self._verify(target)
+
+    def _verify(self, target, tol_mm=20.0):   # 10 -> 20,符合這支手臂實際精度
+        actual = self._mc.get_coords()
+        if not actual:
+            print("⚠ 讀不回座標,無法確認到位")
+            return False
+        err = float(np.linalg.norm(np.array(actual[:3]) - np.array(target[:3])))
+        if err > tol_mm:
+            print(f"⚠ 未完全到位:誤差 {err:.1f}mm")
+            return False
+        return True
 
     def home(self, speed: int = 40) -> bool:
         """走關節空間 —— 不受座標 ±280 限制,從任何姿態都能救回來。"""
