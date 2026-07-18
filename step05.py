@@ -136,16 +136,20 @@ class MyCobotArm(ArmInterface):
 # ============================================================
 if __name__ == "__main__":
     arm: ArmInterface = MyCobotArm("/dev/ttyAMA0", 1000000)   # 換手臂只改這一行
-    arm._mc.send_coords([180, 0, 200, 0, 0, 0], 40, 0)   # Z=200,安全範圍內
-    time.sleep(4)
-    
+    # 1) 先用關節空間回安全姿態 —— 不受座標 ±280 限制,一定動得了
+    print("回 home...")
+    arm._mc.send_angles([0, 0, 0, 0, 0, 0], 40)
+    time.sleep(5)
+
+    # 2) 確認現在在合法範圍內
     pose = arm.get_tcp_pose()
-    print("目前 TCP pose(公尺):\n", np.round(pose, 4))
+    coords = pose_to_coords(pose)
+    print("home coords:", [round(v, 1) for v in coords])
+    ok, msg = MyCobotArm._validate(coords)
+    print("在可命令範圍內嗎?", ok, msg)
 
-    # 在目前位置上方抬高 3cm(直接操作 pose 矩陣,單位是公尺)
+    # 3) 現在才做相對移動
     target = pose.copy()
-    target[2, 3] += 0.03
+    target[2, 3] += 0.05
     arm.move_to_pose(target)
-    print("移動後:\n", np.round(arm.get_tcp_pose(), 4))
-
-    # arm.grasp(); arm.release()      # 夾爪測試(確認 set_gripper_state 介面對得上再開)
+    print("移動後 Z(mm):", round(arm.get_tcp_pose()[2, 3] * 1000, 1))
