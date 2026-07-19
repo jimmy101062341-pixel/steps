@@ -1,21 +1,25 @@
 """
 ============================================================
- Step 0.5  手臂介面抽象層(arm-agnostic)— 完整可用版 v2
+ Step 0.5  手臂介面抽象層(arm-agnostic)— v3 閉環版
 ============================================================
 roadmap 原則 1:手臂包成一個類別,pymycobot 只是內部實作。
 上層只透過這個介面操作手臂,永遠不直接呼叫 pymycobot。
 
-實戰修正:
-- 工作 home 用「前伸朝下」關節姿態(非 [0,0,0,0,0,0],那個 Z≈410 超範圍)。
-- move_to_pose 大位移「自動拆成小步」——這支手臂大幅座標移動會嚴重打折/易無解,
-  實測送 20mm 穩定會動,送 50mm 只到約 30mm。拆步後每步都在可動範圍內。
-- 到位容忍度設 25mm:誠實反映這支手臂座標控制的實際精度(約 1-2cm)。
-  ★ 重要結論:280 裸座標精度不足以「裸插」試管,最後對位必須靠
-    hand-eye 相機閉環 + 機構導引(漏斗/V槽)。move_to_pose 只負責「帶到附近」。
-- move_to_pose 超範圍時明確報錯;home() 走關節空間,能從任何姿態救回來。
+v3 重點:move_to_pose 改用「閉環比例控制」取代固定拆步 ——
+  讀當前 -> 算誤差(目標−實際)-> 往誤差方向送 gain 倍 -> 重複到夠近。
+  這比開環拆步聰明:自動適應姿態相關的打折,誤差大就多修幾次。
+  (注意:這是閉環比例控制,不是 gradient descent —— 誤差方向已知,不需摸索。)
+
+閉環三道守門(validate 的完整角色):
+  1. 範圍檢查:每次迭代送出前檢查 ±280,超範圍 clamp 回邊界
+  2. 收斂檢查:誤差 < tolerance 就完成
+  3. 卡住檢查:連續改善 < min_improvement 就判定到極限,誠實中止
+
+★ 定位:此閉環把座標精度從 ~1-2cm 逼到 ~mm 級,但收不到比手臂本身更準。
+  插試管需 sub-mm,仍須靠 hand-eye 相機閉環 + 機構導引。move_to_pose 只「帶到附近」。
 
 介面單位:公尺 + 4x4 齊次矩陣(對齊 ROS2/MoveIt)。
-pymycobot 的 mm 與 rx/ry/rz(extrinsic xyz,Step 0.2 驗證)只活在實作層。
+euler 慣例 extrinsic xyz(Step 0.2 驗證)。
 ============================================================
 """
 
@@ -24,44 +28,33 @@ import time
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-# myCobot 280 send_coords 有效輸入範圍(官方文件:xyz ±280, rpy ±314)
 XYZ_LIM = (-280.0, 280.0)
 RPY_LIM = (-314.0, 314.0)
 
 
 # ============================================================
-#  抽象介面 —— 與廠牌無關
+#  抽象介面
 # ============================================================
 class ArmInterface(ABC):
 
     @abstractmethod
-    def move_to_pose(self, pose: np.ndarray, speed: int = 30) -> bool:
-        """移動 TCP 到目標 pose(4x4 齊次矩陣,公尺)。回傳是否到位。"""
-        ...
+    def move_to_pose(self, pose: np.ndarray, speed: int = 30) -> bool: ...
 
     @abstractmethod
-    def get_tcp_pose(self) -> np.ndarray:
-        """回傳目前 TCP 的 4x4 齊次矩陣(公尺)。"""
-        ...
+    def get_tcp_pose(self) -> np.ndarray: ...
 
     @abstractmethod
-    def home(self) -> bool:
-        """回到已知安全工作姿態(走關節空間,從任何姿態都能救回來)。"""
-        ...
+    def home(self) -> bool: ...
 
     @abstractmethod
-    def grasp(self) -> bool:
-        """閉合夾爪。"""
-        ...
+    def grasp(self) -> bool: ...
 
     @abstractmethod
-    def release(self) -> bool:
-        """張開夾爪。"""
-        ...
+    def release(self) -> bool: ...
 
 
 # ============================================================
-#  pose 矩陣 <-> myCobot coords(沿用 Step 0.2 的 extrinsic xyz)
+#  pose 矩陣 <-> myCobot coords(extrinsic xyz)
 # ============================================================
 def coords_to_pose(coords) -> np.ndarray:
     T = np.eye(4)
@@ -81,7 +74,6 @@ def pose_to_coords(pose: np.ndarray):
 # ============================================================
 class MyCobotArm(ArmInterface):
 
-    # 工作 home:前伸、末端朝下、Z≈197(範圍內、上下有餘裕)。實測定案。
     HOME_JOINTS = [0, -35, -45, 0, -20, 0]
 
     def __init__(self, port: str, baud: int = 115200):
@@ -90,33 +82,75 @@ class MyCobotArm(ArmInterface):
         time.sleep(1)
         self._mc.power_on()
         time.sleep(1)
-        self._settle = 3.0
+        self._settle = 2.5
 
-    # ---- 移動(大位移自動拆小步)----
+    # ---- 閉環移動 ----
     def move_to_pose(self, pose: np.ndarray, speed: int = 30,
-                     max_step_mm: float = 20.0) -> bool:
-        target = pose_to_coords(pose)
+                     gain: float = 0.6,
+                     tolerance_mm: float = 8.0,
+                     min_improvement_mm: float = 2.0,
+                     max_iters: int = 8,
+                     verbose: bool = True) -> bool:
+        """
+        閉環比例控制移動到目標 pose。
+
+        參數:
+          gain               每次補償誤差的比例(0.5~0.7 穩;1.0 易震盪)
+          tolerance_mm       位置誤差 < 此值即視為到位(預設 8mm,對齊手臂系統誤差級)
+          min_improvement_mm 連續改善 < 此值判定「卡住/到極限」而中止(預設 2mm)
+          max_iters          最大迭代次數,防呆上限
+        回傳:是否收斂到 tolerance 內
+        """
+        target = np.array(pose_to_coords(pose))
+
         ok, msg = self._validate(target)
         if not ok:
             raise ValueError(
                 f"目標超出 myCobot 280 可命令範圍 -> {msg}\n"
                 f"  完整目標: {[round(v,1) for v in target]}\n"
-                f"  提示:先呼叫 arm.home() 回工作姿態再做相對移動。")
+                f"  提示:先 arm.home() 再做相對移動。")
 
-        start = self._mc.get_coords()
-        if not start:
-            print("⚠ 讀不到起點座標")
-            return False
+        prev_err = None
+        for it in range(1, max_iters + 1):
+            current = self._read_coords()
+            if current is None:
+                if verbose: print(" 讀不到座標,中止")
+                return False
 
-        # 依直線距離把移動拆成 <= max_step_mm 的小步
-        dist = float(np.linalg.norm(np.array(target[:3]) - np.array(start[:3])))
-        n = max(1, int(np.ceil(dist / max_step_mm)))
-        for k in range(1, n + 1):
-            inter = [start[i] + (target[i] - start[i]) * k / n for i in range(6)]
-            self._mc.send_coords(inter, speed, 0)     # mode 0 關節插補
-            time.sleep(self._settle if k == n else 1.0)
+            error = target - current              # 位置+姿態誤差向量
+            pos_err = float(np.linalg.norm(error[:3]))
 
-        return self._verify(target)
+            # (2) 收斂檢查
+            if pos_err < tolerance_mm:
+                if verbose: print(f"  第 {it} 次到位,誤差 {pos_err:.1f}mm")
+                return True
+
+            # (3) 卡住檢查:改善太少 = 到極限,別再空轉
+            if prev_err is not None and (prev_err - pos_err) < min_improvement_mm:
+                if verbose:
+                    print(f"  第 {it} 次改善僅 {prev_err - pos_err:.1f}mm(<{min_improvement_mm}),"
+                          f"判定到極限。剩餘誤差 {pos_err:.1f}mm")
+                return False
+            prev_err = pos_err
+
+            # 比例補償:往誤差方向送 gain 倍
+            cmd = current + gain * error
+
+            # (1) 範圍守門:每次迭代都檢查,超範圍就 clamp
+            cmd = self._clamp(cmd)
+
+            if verbose:
+                print(f"  [{it}] 誤差 {pos_err:5.1f}mm -> 送出 "
+                      f"[{cmd[0]:.0f},{cmd[1]:.0f},{cmd[2]:.0f}]")
+            self._mc.send_coords(cmd.tolist(), speed, 0)   # mode 0 關節插補
+            time.sleep(self._settle)
+
+        # 用完迭代次數
+        final = self._read_coords()
+        pos_err = float(np.linalg.norm((target - final)[:3])) if final is not None else 999
+        if verbose:
+            print(f"  達最大迭代 {max_iters} 次,剩餘誤差 {pos_err:.1f}mm")
+        return pos_err < tolerance_mm
 
     def home(self, speed: int = 40) -> bool:
         self._mc.send_angles(list(self.HOME_JOINTS), speed)
@@ -128,25 +162,28 @@ class MyCobotArm(ArmInterface):
 
     # ---- 讀取 ----
     def get_tcp_pose(self) -> np.ndarray:
+        c = self._read_coords()
+        if c is None:
+            raise RuntimeError("get_coords 連續讀取失敗")
+        return coords_to_pose(c.tolist())
+
+    def _read_coords(self):
+        """讀座標,回 np.array(6) 或 None。"""
         for _ in range(3):
-            coords = self._mc.get_coords()
-            if coords:
-                return coords_to_pose(coords)
+            c = self._mc.get_coords()
+            if c:
+                return np.array(c, dtype=float)
             time.sleep(0.2)
-        raise RuntimeError("get_coords 連續讀取失敗")
+        return None
 
     # ---- 夾爪 ----
     def grasp(self) -> bool:
-        self._mc.set_gripper_state(1, 50)
-        time.sleep(1.5)
-        return True
+        self._mc.set_gripper_state(1, 50); time.sleep(1.5); return True
 
     def release(self) -> bool:
-        self._mc.set_gripper_state(0, 50)
-        time.sleep(1.5)
-        return True
+        self._mc.set_gripper_state(0, 50); time.sleep(1.5); return True
 
-    # ---- 內部 ----
+    # ---- 內部:範圍 ----
     @staticmethod
     def _validate(coords):
         for n, v in zip(("x", "y", "z"), coords[:3]):
@@ -157,39 +194,32 @@ class MyCobotArm(ArmInterface):
                 return False, f"{n}={v:.1f} 超出 {RPY_LIM}"
         return True, ""
 
-    def _verify(self, target, tol_mm=25.0):
-        """到位驗證。25mm 容忍度誠實反映這支手臂座標控制的實際精度。"""
-        actual = self._mc.get_coords()
-        if not actual:
-            print("⚠ 讀不回座標,無法確認到位")
-            return False
-        err = float(np.linalg.norm(np.array(actual[:3]) - np.array(target[:3])))
-        if err > tol_mm:
-            print(f"⚠ 未完全到位:誤差 {err:.1f}mm")
-            return False
-        print(f"  到位(誤差 {err:.1f}mm)")
-        return True
+    @staticmethod
+    def _clamp(coords):
+        """把座標壓回可命令範圍,避免閉環中途送出超範圍指令。"""
+        c = np.array(coords, dtype=float)
+        c[:3] = np.clip(c[:3], XYZ_LIM[0], XYZ_LIM[1])
+        c[3:] = np.clip(c[3:], RPY_LIM[0], RPY_LIM[1])
+        return c
 
 
 # ============================================================
-#  示範:上層完全沒有 pymycobot 的影子
+#  示範
 # ============================================================
 if __name__ == "__main__":
-    arm: ArmInterface = MyCobotArm("/dev/ttyAMA0", 1000000)   # 換手臂只改這一行
+    arm: ArmInterface = MyCobotArm("/dev/ttyAMA0", 1000000)
 
     print("回工作 home...")
     arm.home()
 
     pose = arm.get_tcp_pose()
-    coords = pose_to_coords(pose)
-    print("home coords:", [round(v, 1) for v in coords])
-    ok, msg = MyCobotArm._validate(coords)
-    print("在可命令範圍內嗎?", ok, msg if msg else "(是)")
+    print("home coords:", [round(v, 1) for v in pose_to_coords(pose)])
 
-    # 抬高 5cm —— 會自動拆成小步
+    # 抬高 5cm —— 觀察閉環怎麼一步步收斂
     target = pose.copy()
     target[2, 3] += 0.05
-    moved = arm.move_to_pose(target)
-    print("移動後 Z(mm):", round(arm.get_tcp_pose()[2, 3] * 1000, 1), " 到位:", moved)
+    print("\n閉環移動(抬高 50mm):")
+    moved = arm.move_to_pose(target, gain=0.6, tolerance_mm=8.0)
+    print("最終 Z(mm):", round(arm.get_tcp_pose()[2, 3] * 1000, 1), " 到位:", moved)
 
     arm.home()
