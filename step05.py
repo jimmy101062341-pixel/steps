@@ -74,7 +74,10 @@ def pose_to_coords(pose: np.ndarray):
 # ============================================================
 class MyCobotArm(ArmInterface):
 
-    HOME_JOINTS = [0, -35, -45, 0, -20, 0]
+    # 工作 home:實測定案的「中段」姿態。
+    # Z≈152、向上行程 62mm、遠離桌面與天花板,各方向都有餘裕。
+    # (對照:J3=-45 的 home 只有 25mm 行程,卡在工作空間上緣——已淘汰。)
+    HOME_JOINTS = [0, -35, -60, 0, -10, 0]
 
     def __init__(self, port: str, baud: int = 115200):
         from pymycobot import MyCobot280
@@ -114,7 +117,7 @@ class MyCobotArm(ArmInterface):
         for it in range(1, max_iters + 1):
             current = self._read_coords()
             if current is None:
-                if verbose: print(" 讀不到座標,中止")
+                if verbose: print("  ⚠ 讀不到座標,中止")
                 return False
 
             error = target - current              # 位置+姿態誤差向量
@@ -122,13 +125,13 @@ class MyCobotArm(ArmInterface):
 
             # (2) 收斂檢查
             if pos_err < tolerance_mm:
-                if verbose: print(f"  第 {it} 次到位,誤差 {pos_err:.1f}mm")
+                if verbose: print(f"  ✓ 第 {it} 次到位,誤差 {pos_err:.1f}mm")
                 return True
 
             # (3) 卡住檢查:改善太少 = 到極限,別再空轉
             if prev_err is not None and (prev_err - pos_err) < min_improvement_mm:
                 if verbose:
-                    print(f"  第 {it} 次改善僅 {prev_err - pos_err:.1f}mm(<{min_improvement_mm}),"
+                    print(f"  ⚠ 第 {it} 次改善僅 {prev_err - pos_err:.1f}mm(<{min_improvement_mm}),"
                           f"判定到極限。剩餘誤差 {pos_err:.1f}mm")
                 return False
             prev_err = pos_err
@@ -149,7 +152,7 @@ class MyCobotArm(ArmInterface):
         final = self._read_coords()
         pos_err = float(np.linalg.norm((target - final)[:3])) if final is not None else 999
         if verbose:
-            print(f"  達最大迭代 {max_iters} 次,剩餘誤差 {pos_err:.1f}mm")
+            print(f"  ⚠ 達最大迭代 {max_iters} 次,剩餘誤差 {pos_err:.1f}mm")
         return pos_err < tolerance_mm
 
     def home(self, speed: int = 40) -> bool:
